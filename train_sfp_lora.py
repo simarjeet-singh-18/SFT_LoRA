@@ -13,6 +13,7 @@ from plotting import (
     plot_training_curves,
     plot_snip_saliency,
     plot_param_breakdown,
+    plot_lr_schedule,
     save_history_csv,
     save_metrics_summary,
 )
@@ -83,10 +84,17 @@ def main():
     parser.add_argument("--pruned-block", type=int, default=-1, help="-1 runs SNIP search automatically")
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
+    parser.add_argument("--lora-dropout", type=float, default=0.0,
+                         help="Dropout applied to LoRA adapter input (0.0 disables it). "
+                              "Useful regularization when training on small subsets (e.g. VTAB-1k-style splits).")
     parser.add_argument("--lr", type=float, default=1e-3, help="LR for filter block, LayerNorm, and head")
     parser.add_argument("--lora-lr", type=float, default=3e-4, help="LR for LoRA adapter params (A/B matrices)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--warmup-epochs", type=int, default=0,
+                         help="Linear LR warmup epochs before cosine decay begins. 0 disables warmup.")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.0,
+                         help="Cosine decay floor as a fraction of each group's peak LR (e.g. 0.01 = decay to 1% of peak).")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir", type=str, default="./outputs",
@@ -126,7 +134,8 @@ def main():
         model,
         pruned_block_idx=pruned_block_idx,
         lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
     )
 
     # Initialize single filter weights via Ridge Pseudo-Inverse
@@ -153,12 +162,39 @@ def main():
     n_lora = sum(p.numel() for p in lora_params)
     print(f"[SFP] Optimizer groups -> main: {n_main:,} params @ lr={args.lr} | lora: {n_lora:,} params @ lr={args.lora_lr}")
 
+    # Cosine LR schedule, matching the paper's CosineLRScheduler + AdamW protocol.
+    # Each param group decays from its own peak LR down to min_lr_ratio * peak, over
+    # (epochs - warmup_epochs) steps, with an optional linear warmup beforehand.
+    # eta_min is set per-group since main_params and lora_params can have different peak LRs.
+    warmup_epochs = min(args.warmup_epochs, max(args.epochs - 1, 0))
+    cosine_epochs = max(args.epochs - warmup_epochs, 1)
+    eta_mins = [args.lr * args.min_lr_ratio, args.lora_lr * args.min_lr_ratio]
+
+    cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cosine_epochs, eta_min=0.0
+    )
+    # CosineAnnealingLR ignores per-group eta_min unless passed as a list in newer torch;
+    # to stay compatible across torch versions, we manually floor the LR after each step instead.
+
+    if warmup_epochs > 0:
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_epochs
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs]
+        )
+    else:
+        scheduler = cosine_sched
+
+    print(f"[SFP] LR schedule: {warmup_epochs} warmup epoch(s) -> cosine decay over {cosine_epochs} epoch(s), "
+          f"min_lr_ratio={args.min_lr_ratio}")
+
     criterion = nn.CrossEntropyLoss()
 
     print(f"[SFP] Starting training for {args.epochs} epochs on {args.dataset.upper()}...")
     best_val, best_epoch, best_path = 0.0, 0, os.path.join(output_dir, f"best_sfp_lora_{args.dataset}.pt")
 
-    history = {"epoch": [], "train_loss": [], "val_loss": [], "val_acc": []}
+    history = {"epoch": [], "train_loss": [], "val_loss": [], "val_acc": [], "lr_main": [], "lr_lora": []}
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -175,23 +211,42 @@ def main():
         epoch_loss = running_loss / len(train_loader.dataset)
         val_loss, val_acc = evaluate_full(model, val_loader, args.device, criterion)
 
+        # Record current LR *before* stepping the scheduler for this epoch's log line,
+        # then step + apply the manual min-LR floor for next epoch.
+        lr_main_now = optimizer.param_groups[0]["lr"]
+        lr_lora_now = optimizer.param_groups[1]["lr"] if n_lora > 0 else None
+
         history["epoch"].append(epoch)
         history["train_loss"].append(epoch_loss)
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
+        history["lr_main"].append(lr_main_now)
+        history["lr_lora"].append(lr_lora_now)
 
         if val_acc > best_val:
             best_val, best_epoch = val_acc, epoch
             torch.save(model.state_dict(), best_path)
 
+        lr_lora_display = f"{lr_lora_now:.2e}" if lr_lora_now is not None else "n/a"
         print(f"[Epoch {epoch:03d}/{args.epochs:03d}] Train Loss: {epoch_loss:.4f} | "
-              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | Best Val: {best_val:.2f}%")
+              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | Best Val: {best_val:.2f}% | "
+              f"LR(main/lora): {lr_main_now:.2e}/{lr_lora_display}")
+
+        scheduler.step()
+        # Manually floor each group's LR at min_lr_ratio * its own peak, since
+        # CosineAnnealingLR's built-in eta_min doesn't support per-group floors
+        # across all torch versions.
+        for group, peak_lr, eta_min in zip(optimizer.param_groups, [args.lr, args.lora_lr], eta_mins):
+            if group["lr"] < eta_min:
+                group["lr"] = eta_min
 
     # Save curves + raw per-epoch history as soon as training finishes, so they exist
     # even if something later (checkpoint reload, test eval) fails.
     curve_paths = plot_training_curves(history, output_dir, dataset_name=args.dataset)
+    lr_plot_path = plot_lr_schedule(history, output_dir, dataset_name=args.dataset)
     csv_path = save_history_csv(history, output_dir)
     print(f"[SFP] Saved training curves -> {curve_paths}")
+    print(f"[SFP] Saved LR schedule plot -> {lr_plot_path}")
     print(f"[SFP] Saved per-epoch history CSV -> {csv_path}")
 
     # Load best checkpoint and evaluate test set
@@ -213,8 +268,11 @@ def main():
         "pruned_block_idx": pruned_block_idx,
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
         "lr_main": args.lr,
         "lr_lora": args.lora_lr,
+        "warmup_epochs": warmup_epochs,
+        "min_lr_ratio": args.min_lr_ratio,
         "weight_decay": args.weight_decay,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -225,6 +283,7 @@ def main():
         "param_breakdown": param_breakdown,
         "plots": {
             **curve_paths,
+            "lr_schedule": lr_plot_path,
             "snip_saliency": snip_plot_path if snip_saliencies is not None else None,
             "param_breakdown": param_plot_path,
         },

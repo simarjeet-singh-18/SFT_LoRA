@@ -25,6 +25,31 @@ def ensure_dir(path: str) -> str:
     return path
 
 
+def plot_lr_schedule(history: dict, save_dir: str, dataset_name: str = "") -> str:
+    """
+    Plots per-epoch learning rate(s). Expects history to contain "epoch" and one or
+    more of "lr_main", "lr_lora".
+    """
+    ensure_dir(save_dir)
+    epochs = history["epoch"]
+
+    plt.figure(figsize=(7, 5))
+    if "lr_main" in history:
+        plt.plot(epochs, history["lr_main"], label="Main LR (filter block / LN / head)", color="tab:blue")
+    if "lr_lora" in history and any(v is not None for v in history["lr_lora"]):
+        plt.plot(epochs, history["lr_lora"], label="LoRA LR", color="tab:purple")
+    plt.xlabel("Epoch")
+    plt.ylabel("Learning Rate")
+    plt.title(f"LR Schedule{' - ' + dataset_name if dataset_name else ''}")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    path = os.path.join(save_dir, "lr_schedule.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    return path
+
+
 def plot_training_curves(history: dict, save_dir: str, dataset_name: str = "") -> dict:
     """
     Expects history = {"epoch": [...], "train_loss": [...], "val_loss": [...], "val_acc": [...]}

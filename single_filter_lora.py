@@ -117,6 +117,7 @@ def apply_single_filter_and_lora(
     pruned_block_idx: int,
     lora_rank: int = 16,
     lora_alpha: float = 32.0,
+    lora_dropout: float = 0.0,
     target_keywords: list = ["qkv", "proj", "fc1", "fc2"]
 ) -> SingleFilterBlock:
     """
@@ -141,7 +142,7 @@ def apply_single_filter_and_lora(
                 parent_name, attr_name = name.rsplit(".", 1) if "." in name else ("", name)
                 parent = block if parent_name == "" else block.get_submodule(parent_name)
 
-                lora_layer = LoRALinear(module, rank=lora_rank, alpha=lora_alpha)
+                lora_layer = LoRALinear(module, rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout)
                 setattr(parent, attr_name, lora_layer)
                 lora_params += lora_rank * (module.in_features + module.out_features)
 
@@ -166,6 +167,7 @@ def apply_single_filter_and_lora(
             param.requires_grad = False
 
     print(f"[SFP-SingleFilter] Substituted block {pruned_block_idx} with Single Filter Block.")
-    print(f"[SFP-SingleFilter] Injected {lora_params:,} LoRA parameters (rank={lora_rank}, alpha={lora_alpha}).")
+    print(f"[SFP-SingleFilter] Injected {lora_params:,} LoRA parameters "
+          f"(rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}).")
     print(f"[SFP-SingleFilter] Unfroze {ln_params:,} LayerNorm parameters across all blocks.")
     return filter_block
