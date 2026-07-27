@@ -1,5 +1,6 @@
 logs/
 scheduler/
 data/
+outputs/
 __pycache__/
 *pt

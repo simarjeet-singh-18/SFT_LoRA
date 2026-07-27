@@ -44,11 +44,16 @@ def select_block_with_snip(
     model: nn.Module,
     dataloader: torch.utils.data.DataLoader,
     device: str = "cuda",
-    keep: str = "low"
-) -> int:
+    keep: str = "low",
+    return_scores: bool = False,
+):
     """
     Selects block index with lowest (keep='low') or highest (keep='high') SNIP score.
     Default keep='low' selects candidate block for replacement (redundant/replaceable block).
+
+    If return_scores=True, returns (selected_idx, saliencies_dict) so the caller can
+    plot the full per-block saliency profile. Default behavior (return_scores=False)
+    is unchanged for backward compatibility.
     """
     saliencies = compute_snip_saliency_for_blocks(model, dataloader, device)
 
@@ -60,6 +65,8 @@ def select_block_with_snip(
         print(f"  - Block {idx:02d}: {score:.6f}")
     print(f"[SNIP Search] Selected Block {selected_idx} (keep='{keep}')")
 
+    if return_scores:
+        return selected_idx, saliencies
     return selected_idx
 
 
