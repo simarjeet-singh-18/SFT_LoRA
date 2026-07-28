@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -8,6 +9,7 @@ import timm
 from data import get_dataloaders
 from single_filter_lora import apply_single_filter_and_lora, count_parameter_breakdown
 from snip_selection import select_block_with_snip
+from run_naming import build_run_folder_name
 from plotting import (
     ensure_dir,
     plot_training_curves,
@@ -102,7 +104,9 @@ def main():
                               "A per-dataset subfolder is created automatically.")
     args = parser.parse_args()
 
-    output_dir = ensure_dir(os.path.join(args.output_dir, args.dataset))
+    run_name = build_run_folder_name(sys.argv[1:])
+    output_dir = ensure_dir(os.path.join(args.output_dir, run_name))
+    print(f"[SFP] Run folder name (from CLI args passed): {run_name}")
     print(f"[SFP] Outputs (plots, CSV, metrics JSON) will be saved to: {output_dir}")
 
     # 1. Load Data
