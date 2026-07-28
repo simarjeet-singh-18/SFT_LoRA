@@ -3,6 +3,33 @@ import torch
 from torch.utils.data import DataLoader, Subset, random_split
 from torchvision import datasets, transforms
 
+# Centralized so other modules (e.g. misclassified-image denormalization) use the
+# exact same values the transforms were built with.
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def get_class_names(dataset, num_classes: int) -> list:
+    """
+    Best-effort human-readable class names, for labeling saved misclassified images.
+    Unwraps Subset/random_split chains to find the underlying torchvision dataset,
+    then checks the usual attribute names torchvision datasets use for class labels.
+    Falls back to numeric string labels ("0", "1", ...) if nothing is found.
+    """
+    base = dataset
+    seen = set()
+    while hasattr(base, "dataset") and id(base) not in seen:
+        seen.add(id(base))
+        base = base.dataset
+
+    for attr in ("classes", "categories"):
+        if hasattr(base, attr):
+            names = list(getattr(base, attr))
+            if len(names) == num_classes:
+                return names
+
+    return [str(i) for i in range(num_classes)]
+
 
 def get_dataset_by_name(name: str, root: str, train: bool, transform, seed: int = 42):
     """
@@ -45,13 +72,13 @@ def get_dataloaders(args):
         transforms.Resize((224, 224)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
     transform_test = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
     data_dir = "./data"
@@ -110,4 +137,6 @@ def get_dataloaders(args):
     print(f"[Data] Loaded '{dataset_name}' with {num_classes} classes.")
     print(f"[Data] Splits -> Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
 
-    return train_loader, val_loader, test_loader, num_classes
+    class_names = get_class_names(test_dataset, num_classes)
+
+    return train_loader, val_loader, test_loader, num_classes, class_names
