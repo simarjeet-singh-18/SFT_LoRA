@@ -68,22 +68,29 @@ class SingleFilterBlock(nn.Module):
         return self.dropout(F.linear(x, self.weight, self.bias))
 
 
-def count_parameter_breakdown(model: nn.Module, pruned_block_idx: int) -> dict:
+def count_parameter_breakdown(model: nn.Module, pruned_block_idx=None) -> dict:
     """
     Categorizes every parameter in the model for reporting/plotting purposes.
     Categories (checked in this order, first match wins):
-      - filter_block   : the SingleFilterBlock replacing model.blocks[pruned_block_idx]
-      - lora           : LoRA A/B matrices injected into remaining blocks
-      - layernorm      : unfrozen LN params (norm1/norm2/final norm)
-      - head           : classifier head
-      - frozen_backbone: everything else (untouched, frozen pretrained weights)
+      - filter_block     : the SingleFilterBlock replacing model.blocks[pruned_block_idx]
+                            (only applies when pruned_block_idx is not None)
+      - lora              : LoRA A/B matrices injected into remaining blocks
+      - layernorm         : unfrozen LN params (norm1/norm2/final norm)
+      - head              : classifier head
+      - trainable_backbone: anything else that IS trainable (e.g. full-finetune mode,
+                             where the whole backbone is unfrozen and there's no filter
+                             block / LoRA to separate out)
+      - frozen_backbone   : anything else that is NOT trainable
     Also returns total_params, trainable_params, and trainable_pct.
+
+    Pass pruned_block_idx=None for full-finetune runs (no block substitution happened).
     """
     breakdown = {
         "filter_block": 0,
         "lora": 0,
         "layernorm": 0,
         "head": 0,
+        "trainable_backbone": 0,
         "frozen_backbone": 0,
     }
     total = 0
@@ -95,7 +102,7 @@ def count_parameter_breakdown(model: nn.Module, pruned_block_idx: int) -> dict:
         if param.requires_grad:
             trainable += n
 
-        if f"blocks.{pruned_block_idx}" in name:
+        if pruned_block_idx is not None and f"blocks.{pruned_block_idx}" in name:
             breakdown["filter_block"] += n
         elif "lora_" in name:
             breakdown["lora"] += n
@@ -103,6 +110,8 @@ def count_parameter_breakdown(model: nn.Module, pruned_block_idx: int) -> dict:
             breakdown["layernorm"] += n
         elif "head" in name:
             breakdown["head"] += n
+        elif param.requires_grad:
+            breakdown["trainable_backbone"] += n
         else:
             breakdown["frozen_backbone"] += n
 

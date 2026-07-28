@@ -1,6 +1,9 @@
 import argparse
 import os
+import random
 import sys
+
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -19,6 +22,29 @@ from plotting import (
     save_history_csv,
     save_metrics_summary,
 )
+
+
+def set_seed(seed: int, deterministic: bool = True) -> None:
+    """
+    Seeds every RNG the pipeline touches (python random, numpy, torch CPU/CUDA),
+    for reproducible data splits, model/LoRA init, and DataLoader shuffle order.
+
+    deterministic=True additionally enables full cuDNN determinism (slower, but
+    removes GPU-kernel-level run-to-run variance on top of the RNG seeding).
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        torch.backends.cudnn.benchmark = True
+
+    print(f"[Seed] Global seed set to {seed} (deterministic={deterministic}).")
 
 
 def extract_block_inputs_outputs(model: nn.Module, dataloader: DataLoader, block_idx: int, device: str):
@@ -84,6 +110,12 @@ def main():
     parser.add_argument("--num-samples", type=int, default=1000)
     parser.add_argument("--use-full-dataset", action="store_true")
     parser.add_argument("--pruned-block", type=int, default=-1, help="-1 runs SNIP search automatically")
+    parser.add_argument("--full-finetune", action="store_true",
+                         help="Baseline comparison mode: bypass SNIP search, filter block substitution, "
+                              "and LoRA entirely, and fine-tune the ENTIRE pretrained backbone + head "
+                              "instead (i.e. the paper's 'Full' baseline in Table 1/2). "
+                              "--pruned-block, --lora-rank, --lora-alpha, --lora-dropout are ignored "
+                              "when this is set.")
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
     parser.add_argument("--lora-dropout", type=float, default=0.0,
@@ -99,10 +131,19 @@ def main():
                          help="Cosine decay floor as a fraction of each group's peak LR (e.g. 0.01 = decay to 1% of peak).")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--seed", type=int, default=42, help="Global RNG seed (data splits, model init, "
+                                                               "LoRA init, DataLoader shuffle order).")
+    parser.add_argument("--deterministic", action="store_true",
+                         help="Enable full cuDNN determinism (slower, but removes GPU-kernel-level "
+                              "run-to-run variance on top of the RNG seeding).")
     parser.add_argument("--output-dir", type=str, default="./outputs",
                          help="Root directory for plots, CSV history, and metrics summary. "
                               "A per-dataset subfolder is created automatically.")
     args = parser.parse_args()
+
+    # set_seed(args.seed, deterministic=args.deterministic)
+    set_seed(args.seed, True)
+    
 
     run_name = build_run_folder_name(sys.argv[1:])
     output_dir = ensure_dir(os.path.join(args.output_dir, run_name))
@@ -117,33 +158,44 @@ def main():
     model = timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=num_classes)
     model.to(args.device)
 
-    # 3. Determine target block index via SNIP search if not specified
-    pruned_block_idx = args.pruned_block
-    if pruned_block_idx < 0:
-        print("[SFP] No block index provided. Running SNIP search...")
-        pruned_block_idx, snip_saliencies = select_block_with_snip(
-            model, train_loader, device=args.device, keep="low", return_scores=True
-        )
-        snip_plot_path = plot_snip_saliency(snip_saliencies, pruned_block_idx, output_dir)
-        print(f"[SFP] Saved SNIP saliency plot -> {snip_plot_path}")
+    # 3. Either: (a) SFP path - SNIP search -> pseudoinverse filter block -> optional LoRA, or
+    #    (b)  Full-finetune baseline - skip all of that, unfreeze the entire model.
+    pruned_block_idx = None
+    snip_saliencies = None
+    snip_plot_path = None
+    filter_block = None
+
+    if args.full_finetune:
+        print("[SFP] --full-finetune set: skipping SNIP search, filter block substitution, "
+              "and LoRA injection. The ENTIRE backbone + head will be trained "
+              "(this is the paper's 'Full' fine-tuning baseline).")
+        for p in model.parameters():
+            p.requires_grad = True
     else:
-        snip_saliencies = None
+        pruned_block_idx = args.pruned_block
+        if pruned_block_idx < 0:
+            print("[SFP] No block index provided. Running SNIP search...")
+            pruned_block_idx, snip_saliencies = select_block_with_snip(
+                model, train_loader, device=args.device, keep="low", return_scores=True
+            )
+            snip_plot_path = plot_snip_saliency(snip_saliencies, pruned_block_idx, output_dir)
+            print(f"[SFP] Saved SNIP saliency plot -> {snip_plot_path}")
 
-    # 4. Extract Block Input/Output features for Pseudo-Inverse Init
-    print(f"[SFP] Extracting representations for Pseudo-Inverse Init at block {pruned_block_idx}...")
-    X_in, X_out = extract_block_inputs_outputs(model, train_loader, pruned_block_idx, args.device)
+        # 4. Extract Block Input/Output features for Pseudo-Inverse Init
+        print(f"[SFP] Extracting representations for Pseudo-Inverse Init at block {pruned_block_idx}...")
+        X_in, X_out = extract_block_inputs_outputs(model, train_loader, pruned_block_idx, args.device)
 
-    # 5. Substitute Single Filter & Inject LoRA
-    filter_block = apply_single_filter_and_lora(
-        model,
-        pruned_block_idx=pruned_block_idx,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-    )
+        # 5. Substitute Single Filter & Inject LoRA (LoRA is a no-op if --lora-rank 0)
+        filter_block = apply_single_filter_and_lora(
+            model,
+            pruned_block_idx=pruned_block_idx,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+        )
 
-    # Initialize single filter weights via Ridge Pseudo-Inverse
-    filter_block.init_from_pinv(X_in.to(args.device), X_out.to(args.device))
+        # Initialize single filter weights via Ridge Pseudo-Inverse
+        filter_block.init_from_pinv(X_in.to(args.device), X_out.to(args.device))
 
     # 6. Optimization Loop
     model.to(args.device)
@@ -269,10 +321,13 @@ def main():
         "dataset": args.dataset,
         "num_classes": num_classes,
         "num_samples": args.num_samples if not args.use_full_dataset else "full",
+        "full_finetune": args.full_finetune,
         "pruned_block_idx": pruned_block_idx,
-        "lora_rank": args.lora_rank,
-        "lora_alpha": args.lora_alpha,
-        "lora_dropout": args.lora_dropout,
+        "lora_rank": args.lora_rank if not args.full_finetune else None,
+        "lora_alpha": args.lora_alpha if not args.full_finetune else None,
+        "lora_dropout": args.lora_dropout if not args.full_finetune else None,
+        "seed": args.seed,
+        "deterministic": args.deterministic,
         "lr_main": args.lr,
         "lr_lora": args.lora_lr,
         "warmup_epochs": warmup_epochs,
@@ -288,7 +343,7 @@ def main():
         "plots": {
             **curve_paths,
             "lr_schedule": lr_plot_path,
-            "snip_saliency": snip_plot_path if snip_saliencies is not None else None,
+            "snip_saliency": snip_plot_path,
             "param_breakdown": param_plot_path,
         },
         "history_csv": csv_path,
@@ -298,13 +353,18 @@ def main():
 
     print(f"\n==================================================")
     print(f"[SFP] Dataset: {args.dataset.upper()}")
-    print(f"[SFP] Replaced Block: {pruned_block_idx} | LoRA rank={args.lora_rank}, alpha={args.lora_alpha}")
+    if args.full_finetune:
+        print(f"[SFP] Mode: FULL FINE-TUNE (baseline, no SFP/LoRA)")
+    else:
+        print(f"[SFP] Mode: SFP | Replaced Block: {pruned_block_idx} | "
+              f"LoRA rank={args.lora_rank}, alpha={args.lora_alpha}, dropout={args.lora_dropout}")
     print(f"[SFP] Trainable Params: {param_breakdown['trainable_params']:,} / "
           f"{param_breakdown['total_params']:,} ({param_breakdown['trainable_pct']:.2f}%)")
-    print(f"[SFP]   - Filter block : {param_breakdown['filter_block']:,}")
-    print(f"[SFP]   - LoRA adapters: {param_breakdown['lora']:,}")
-    print(f"[SFP]   - LayerNorm    : {param_breakdown['layernorm']:,}")
-    print(f"[SFP]   - Head         : {param_breakdown['head']:,}")
+    print(f"[SFP]   - Filter block      : {param_breakdown['filter_block']:,}")
+    print(f"[SFP]   - LoRA adapters     : {param_breakdown['lora']:,}")
+    print(f"[SFP]   - LayerNorm         : {param_breakdown['layernorm']:,}")
+    print(f"[SFP]   - Head              : {param_breakdown['head']:,}")
+    print(f"[SFP]   - Trainable backbone: {param_breakdown['trainable_backbone']:,}")
     print(f"[SFP] Best Val Acc: {best_val:.2f}% (epoch {best_epoch})")
     print(f"[SFP] Final Test Acc: {test_acc:.2f}% | Final Test Loss: {test_loss:.4f}")
     print(f"[SFP] All plots, CSV history, and metrics JSON saved under: {output_dir}")

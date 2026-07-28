@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader, Subset, random_split
 from torchvision import datasets, transforms
 
 
-def get_dataset_by_name(name: str, root: str, train: bool, transform):
+def get_dataset_by_name(name: str, root: str, train: bool, transform, seed: int = 42):
     """
     Helper to fetch torchvision standard datasets.
     """
@@ -28,7 +28,7 @@ def get_dataset_by_name(name: str, root: str, train: bool, transform):
         train_len = int(0.8 * len(dataset))
         test_len = len(dataset) - train_len
         train_set, test_set = random_split(
-            dataset, [train_len, test_len], generator=torch.Generator().manual_seed(42)
+            dataset, [train_len, test_len], generator=torch.Generator().manual_seed(seed)
         )
         return train_set if train else test_set
     elif name == "cifar100":
@@ -61,10 +61,11 @@ def get_dataloaders(args):
     batch_size = getattr(args, "batch_size", 32)
     num_samples = getattr(args, "num_samples", 1000)
     use_full = getattr(args, "use_full_dataset", False)
+    seed = getattr(args, "seed", 42)
 
     # 1. Load raw datasets
-    full_trainset = get_dataset_by_name(dataset_name, root=data_dir, train=True, transform=transform_train)
-    test_dataset = get_dataset_by_name(dataset_name, root=data_dir, train=False, transform=transform_test)
+    full_trainset = get_dataset_by_name(dataset_name, root=data_dir, train=True, transform=transform_train, seed=seed)
+    test_dataset = get_dataset_by_name(dataset_name, root=data_dir, train=False, transform=transform_test, seed=seed)
 
     # Determine num_classes automatically
     if hasattr(full_trainset, "classes"):
@@ -83,22 +84,26 @@ def get_dataloaders(args):
         train_len = int(0.85 * len(full_trainset))
         val_len = len(full_trainset) - train_len
         train_dataset, val_dataset = random_split(
-            full_trainset, [train_len, val_len], generator=torch.Generator().manual_seed(42)
+            full_trainset, [train_len, val_len], generator=torch.Generator().manual_seed(seed)
         )
     else:
         # N-shot style subset (e.g., 1000 samples)
         total_avail = len(full_trainset)
         actual_samples = min(num_samples, total_avail)
-        indices = torch.randperm(total_avail, generator=torch.Generator().manual_seed(42))[:actual_samples]
+        indices = torch.randperm(total_avail, generator=torch.Generator().manual_seed(seed))[:actual_samples]
         subset = Subset(full_trainset, indices)
 
         train_len = int(0.8 * actual_samples)
         val_len = actual_samples - train_len
         train_dataset, val_dataset = random_split(
-            subset, [train_len, val_len], generator=torch.Generator().manual_seed(42)
+            subset, [train_len, val_len], generator=torch.Generator().manual_seed(seed)
         )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    # Seed the train loader's shuffle order too (PyTorch derives per-worker seeds from
+    # this generator, so batch order is reproducible across runs with num_workers>0).
+    train_generator = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4,
+                               pin_memory=True, generator=train_generator)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
