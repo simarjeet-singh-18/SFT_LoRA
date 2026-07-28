@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import random
 import sys
@@ -7,9 +8,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torchvision.utils import save_image
 import timm
 
-from data import get_dataloaders
+from data import get_dataloaders, IMAGENET_MEAN, IMAGENET_STD
 from single_filter_lora import apply_single_filter_and_lora, count_parameter_breakdown
 from snip_selection import select_block_with_snip
 from run_naming import build_run_folder_name
@@ -24,7 +26,7 @@ from plotting import (
 )
 
 
-def set_seed(seed: int, deterministic: bool = True) -> None:
+def set_seed(seed: int, deterministic: bool = False) -> None:
     """
     Seeds every RNG the pipeline touches (python random, numpy, torch CPU/CUDA),
     for reproducible data splits, model/LoRA init, and DataLoader shuffle order.
@@ -104,6 +106,97 @@ def evaluate_full(model: nn.Module, dataloader: DataLoader, device: str, criteri
     return avg_loss, acc
 
 
+def denormalize(tensor: torch.Tensor, mean: list, std: list) -> torch.Tensor:
+    """Undoes transforms.Normalize so images can be saved as viewable PNGs."""
+    mean_t = torch.tensor(mean, device=tensor.device).view(1, -1, 1, 1)
+    std_t = torch.tensor(std, device=tensor.device).view(1, -1, 1, 1)
+    return (tensor * std_t + mean_t).clamp(0, 1)
+
+
+def evaluate_and_save_misclassified(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: str,
+    criterion: nn.Module,
+    output_dir: str,
+    class_names: list = None,
+    mean: list = None,
+    std: list = None,
+    max_images: int = 200,
+):
+    """
+    Same as evaluate_full (loss + accuracy over dataloader), but additionally saves
+    every misclassified image as a PNG under <output_dir>/misclassified/, plus a CSV
+    log (misclassified_log.csv) with true/predicted labels and confidence.
+
+    max_images caps how many images get saved (<=0 means unlimited) to avoid dumping
+    thousands of files on large test sets; loss/accuracy are still computed over the
+    FULL dataset regardless of the cap. Mode-agnostic: works identically whether the
+    model came from SFP, SFP+LoRA, or --full-finetune, since it only touches the
+    final test-evaluation step, which is already shared across all three.
+    """
+    mean = mean or IMAGENET_MEAN
+    std = std or IMAGENET_STD
+
+    misclassified_dir = ensure_dir(os.path.join(output_dir, "misclassified"))
+    csv_path = os.path.join(misclassified_dir, "misclassified_log.csv")
+
+    model.eval()
+    correct, total, loss_sum, saved_count, global_idx = 0, 0, 0.0, 0, 0
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "sample_index", "true_label_idx", "true_label_name",
+                          "pred_label_idx", "pred_label_name", "confidence"])
+
+        with torch.no_grad():
+            for batch in dataloader:
+                x, y = batch[0].to(device), batch[1].to(device)
+                out = model(x)
+                loss = criterion(out, y)
+                loss_sum += loss.item() * x.size(0)
+
+                probs = torch.softmax(out, dim=-1)
+                confs, preds = probs.max(dim=-1)
+                correct += (preds == y).sum().item()
+                total += y.size(0)
+
+                mismatches = (preds != y).nonzero(as_tuple=True)[0]
+                if mismatches.numel() > 0:
+                    imgs_denorm = denormalize(x[mismatches].detach(), mean, std).cpu()
+                    for local_i, sample_i in enumerate(mismatches.tolist()):
+                        if max_images > 0 and saved_count >= max_images:
+                            continue
+                        true_idx = int(y[sample_i].item())
+                        pred_idx = int(preds[sample_i].item())
+                        conf = float(confs[sample_i].item())
+                        true_name = str(class_names[true_idx]) if class_names else str(true_idx)
+                        pred_name = str(class_names[pred_idx]) if class_names else str(pred_idx)
+
+                        safe_true = true_name.replace("/", "-").replace(" ", "_")
+                        safe_pred = pred_name.replace("/", "-").replace(" ", "_")
+                        fname = f"idx{global_idx + sample_i:05d}_true-{safe_true}_pred-{safe_pred}_conf{conf:.2f}.png"
+
+                        save_image(imgs_denorm[local_i], os.path.join(misclassified_dir, fname))
+                        writer.writerow([fname, global_idx + sample_i, true_idx, true_name,
+                                          pred_idx, pred_name, f"{conf:.4f}"])
+                        saved_count += 1
+
+                global_idx += y.size(0)
+
+    avg_loss = loss_sum / total
+    acc = (correct / total) * 100.0
+    total_misclassified = total - correct
+    print(f"[SFP] Misclassified images: saved {saved_count} / {total_misclassified} total "
+          f"misclassified on test set -> {misclassified_dir}")
+    if max_images > 0 and total_misclassified > max_images:
+        print(f"[SFP] Note: capped at --max-misclassified-images={max_images}; "
+              f"{total_misclassified - saved_count} additional misclassified samples were not saved.")
+    print(f"[SFP] Misclassified log CSV -> {csv_path}")
+
+    return avg_loss, acc, saved_count, csv_path, misclassified_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description="SFP Single Filter + LoRA Fine-Tuning")
     parser.add_argument("--dataset", type=str, default="pets", choices=["pets", "svhn", "flowers102", "dtd", "caltech101", "cifar100"])
@@ -139,11 +232,16 @@ def main():
     parser.add_argument("--output-dir", type=str, default="./outputs",
                          help="Root directory for plots, CSV history, and metrics summary. "
                               "A per-dataset subfolder is created automatically.")
+    parser.add_argument("--save-misclassified-images", action="store_true",
+                         help="Save every misclassified test-set image (denormalized PNG) into "
+                              "<output_dir>/misclassified/, plus a CSV log of true/predicted labels "
+                              "and confidence. Works identically for SFP, SFP+LoRA, and --full-finetune.")
+    parser.add_argument("--max-misclassified-images", type=int, default=200,
+                         help="Cap on how many misclassified images to save to disk (<=0 = unlimited). "
+                              "Test accuracy/loss are still computed over the full test set regardless.")
     args = parser.parse_args()
 
-    # set_seed(args.seed, deterministic=args.deterministic)
-    set_seed(args.seed, True)
-    
+    set_seed(args.seed, deterministic=args.deterministic)
 
     run_name = build_run_folder_name(sys.argv[1:])
     output_dir = ensure_dir(os.path.join(args.output_dir, run_name))
@@ -151,7 +249,7 @@ def main():
     print(f"[SFP] Outputs (plots, CSV, metrics JSON) will be saved to: {output_dir}")
 
     # 1. Load Data
-    train_loader, val_loader, test_loader, num_classes = get_dataloaders(args)
+    train_loader, val_loader, test_loader, num_classes, class_names = get_dataloaders(args)
 
     # 2. Load Pretrained Backbone
     print(f"[SFP] Loading ViT backbone for {num_classes} output classes...")
@@ -310,7 +408,18 @@ def main():
         model.load_state_dict(torch.load(best_path))
         print(f"[SFP] Restored best model checkpoint (val_acc={best_val:.2f}%, epoch {best_epoch})")
 
-    test_loss, test_acc = evaluate_full(model, test_loader, args.device, criterion)
+    test_loss, test_acc, misclassified_saved, misclassified_csv, misclassified_dir = (
+        None, None, None, None, None
+    )
+    if args.save_misclassified_images:
+        test_loss, test_acc, misclassified_saved, misclassified_csv, misclassified_dir = (
+            evaluate_and_save_misclassified(
+                model, test_loader, args.device, criterion, output_dir,
+                class_names=class_names, max_images=args.max_misclassified_images,
+            )
+        )
+    else:
+        test_loss, test_acc = evaluate_full(model, test_loader, args.device, criterion)
 
     # Parameter breakdown (filter block / LoRA / LayerNorm / head / frozen backbone)
     param_breakdown = count_parameter_breakdown(model, pruned_block_idx)
@@ -348,6 +457,13 @@ def main():
         },
         "history_csv": csv_path,
         "checkpoint_path": best_path,
+        "misclassified_images": {
+            "enabled": args.save_misclassified_images,
+            "saved_count": misclassified_saved,
+            "max_images_cap": args.max_misclassified_images if args.save_misclassified_images else None,
+            "csv": misclassified_csv,
+            "dir": misclassified_dir,
+        },
     }
     summary_path = save_metrics_summary(summary, output_dir)
 
@@ -367,6 +483,8 @@ def main():
     print(f"[SFP]   - Trainable backbone: {param_breakdown['trainable_backbone']:,}")
     print(f"[SFP] Best Val Acc: {best_val:.2f}% (epoch {best_epoch})")
     print(f"[SFP] Final Test Acc: {test_acc:.2f}% | Final Test Loss: {test_loss:.4f}")
+    if args.save_misclassified_images:
+        print(f"[SFP] Misclassified images saved: {misclassified_saved} -> {misclassified_dir}")
     print(f"[SFP] All plots, CSV history, and metrics JSON saved under: {output_dir}")
     print(f"[SFP] Metrics summary JSON -> {summary_path}")
     print(f"==================================================")
