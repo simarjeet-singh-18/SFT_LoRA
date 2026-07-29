@@ -37,6 +37,7 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
@@ -222,6 +223,9 @@ def main():
                          help="Linear LR warmup epochs before cosine decay begins. 0 disables warmup.")
     parser.add_argument("--min-lr-ratio", type=float, default=0.0,
                          help="Cosine decay floor as a fraction of each group's peak LR (e.g. 0.01 = decay to 1% of peak).")
+    parser.add_argument("--grad-clip", type=float, default=0.0,
+                         help="Max gradient norm for clipping (0.0 disables clipping). Cheap safety net "
+                              "against LR spikes destabilizing training, especially in --full-finetune mode.")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42, help="Global RNG seed (data splits, model init, "
@@ -236,12 +240,26 @@ def main():
                          help="Save every misclassified test-set image (denormalized PNG) into "
                               "<output_dir>/misclassified/, plus a CSV log of true/predicted labels "
                               "and confidence. Works identically for SFP, SFP+LoRA, and --full-finetune.")
-    parser.add_argument("--max-misclassified-images", type=int, default=200,
+    parser.add_argument("--max-misclassified-images", type=int, default=-1,
                          help="Cap on how many misclassified images to save to disk (<=0 = unlimited). "
                               "Test accuracy/loss are still computed over the full test set regardless.")
     args = parser.parse_args()
 
-    set_seed(args.seed, deterministic=args.deterministic)
+    # The --lr default (1e-3) was tuned for SFP's tiny filter block + LN + head
+    # (~0.6-2.8M params). Applied to the ENTIRE pretrained backbone in --full-finetune
+    # mode, it's aggressive enough to cause a destructive/catastrophic-forgetting step
+    # once warmup ramps up to peak LR (visible as a train-loss spike right as warmup
+    # ends). Auto-lower it for full-finetune runs, but only if the user didn't
+    # explicitly pass --lr themselves.
+    lr_passed_explicitly = any(tok == "--lr" or tok.startswith("--lr=") for tok in sys.argv[1:])
+    if args.full_finetune and not lr_passed_explicitly:
+        old_lr = args.lr
+        args.lr = 1e-4
+        print(f"[SFP] --full-finetune set without an explicit --lr: lowering default LR "
+              f"from {old_lr} to {args.lr} (the {old_lr} default was tuned for the tiny "
+              f"SFP filter block, not full-backbone fine-tuning). Pass --lr explicitly to override.")
+
+    set_seed(args.seed, True)
 
     run_name = build_run_folder_name(sys.argv[1:])
     output_dir = ensure_dir(os.path.join(args.output_dir, run_name))
@@ -359,6 +377,8 @@ def main():
             out = model(x)
             loss = criterion(out, y)
             loss.backward()
+            if args.grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(main_params + lora_params, max_norm=args.grad_clip)
             optimizer.step()
             running_loss += loss.item() * x.size(0)
 
