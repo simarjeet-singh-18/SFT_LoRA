@@ -1,6 +1,13 @@
 import argparse
 import csv
 import os
+
+# Must be set BEFORE torch is imported / any CUDA context is created. Without this,
+# cuBLAS matmul kernels (Linear layers, attention, AdamW internals) can still use
+# non-deterministic reduction order even with cudnn.deterministic=True, since that
+# flag only governs cuDNN convolution algorithm selection, not cuBLAS.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import random
 import sys
 
@@ -31,19 +38,50 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
     Seeds every RNG the pipeline touches (python random, numpy, torch CPU/CUDA),
     for reproducible data splits, model/LoRA init, and DataLoader shuffle order.
 
-    deterministic=True additionally enables full cuDNN determinism (slower, but
-    removes GPU-kernel-level run-to-run variance on top of the RNG seeding).
+    deterministic=True additionally:
+      - enables full cuDNN determinism (fixed conv algorithm, no autotuning)
+      - calls torch.use_deterministic_algorithms(True), which forces deterministic
+        implementations across ALL of torch (not just cuDNN conv) -- this is what
+        actually pins down cuBLAS matmul / AdamW kernel behavior, which
+        cudnn.deterministic alone does NOT cover
+      - requires CUBLAS_WORKSPACE_CONFIG to have been set before torch was imported
+        (done at the top of this file) for the cuBLAS part to take effect
+      - forces PyTorch's scaled_dot_product_attention (used internally by timm's ViT
+        attention blocks) onto its "math" backend, disabling the flash-attention and
+        memory-efficient-attention fused kernels. Those fused kernels use atomic-add
+        based reductions in their backward pass that are NOT deterministic even under
+        use_deterministic_algorithms(True) -- this was the actual remaining source of
+        run-to-run divergence observed even with the other determinism settings on
+        (visible as tiny ~1e-6 relative differences in SNIP saliency scores between
+        otherwise-identical runs, which then compound over training). The math
+        backend is slower but fully deterministic.
+
+    warn_only=True means any OTHER operation without a deterministic implementation
+    will print a warning and fall back to its normal (possibly non-deterministic)
+    kernel, rather than raising and killing the run. Check the console for such
+    warnings if you still see run-to-run variance with deterministic=True -- they'll
+    name the exact op that's still non-deterministic.
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+        # Disable non-deterministic fused attention kernels (flash / mem-efficient),
+        # forcing the deterministic "math" SDPA backend. Guarded with hasattr since
+        # these toggles were added in newer torch versions.
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(True)
     else:
         torch.backends.cudnn.benchmark = True
 
@@ -230,9 +268,11 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42, help="Global RNG seed (data splits, model init, "
                                                                "LoRA init, DataLoader shuffle order).")
-    parser.add_argument("--deterministic", action="store_true",
-                         help="Enable full cuDNN determinism (slower, but removes GPU-kernel-level "
-                              "run-to-run variance on top of the RNG seeding).")
+    parser.add_argument("--fast", action="store_true",
+                         help="Disable full determinism for faster training (enables cuDNN autotuning "
+                              "and allows non-deterministic algorithms). Reproducibility is ON by default "
+                              "(RNG seeding + cuDNN determinism + torch.use_deterministic_algorithms); "
+                              "pass --fast only if you don't need bit-exact reproducibility and want speed.")
     parser.add_argument("--output-dir", type=str, default="./outputs",
                          help="Root directory for plots, CSV history, and metrics summary. "
                               "A per-dataset subfolder is created automatically.")
@@ -259,7 +299,7 @@ def main():
               f"from {old_lr} to {args.lr} (the {old_lr} default was tuned for the tiny "
               f"SFP filter block, not full-backbone fine-tuning). Pass --lr explicitly to override.")
 
-    set_seed(args.seed, True)
+    set_seed(args.seed, deterministic=not args.fast)
 
     run_name = build_run_folder_name(sys.argv[1:])
     output_dir = ensure_dir(os.path.join(args.output_dir, run_name))
@@ -456,7 +496,7 @@ def main():
         "lora_alpha": args.lora_alpha if not args.full_finetune else None,
         "lora_dropout": args.lora_dropout if not args.full_finetune else None,
         "seed": args.seed,
-        "deterministic": args.deterministic,
+        "deterministic": not args.fast,
         "lr_main": args.lr,
         "lr_lora": args.lora_lr,
         "warmup_epochs": warmup_epochs,

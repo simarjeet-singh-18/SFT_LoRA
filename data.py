@@ -1,4 +1,7 @@
 import os
+import random
+
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset, random_split
 from torchvision import datasets, transforms
@@ -7,6 +10,19 @@ from torchvision import datasets, transforms
 # exact same values the transforms were built with.
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    """
+    Ensures numpy/python-random are also seeded deterministically per DataLoader
+    worker. PyTorch's own per-worker RNG is already pinned via the `generator=`
+    argument passed to DataLoader, but that alone does NOT reseed numpy.random or
+    the stdlib random module inside worker processes -- this closes that gap in
+    case any current or future dataset/transform code uses them.
+    """
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def get_class_names(dataset, num_classes: int) -> list:
@@ -130,9 +146,11 @@ def get_dataloaders(args):
     # this generator, so batch order is reproducible across runs with num_workers>0).
     train_generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4,
-                               pin_memory=True, generator=train_generator)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+                               pin_memory=True, generator=train_generator, worker_init_fn=_worker_init_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4,
+                             pin_memory=True, worker_init_fn=_worker_init_fn)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4,
+                              pin_memory=True, worker_init_fn=_worker_init_fn)
 
     print(f"[Data] Loaded '{dataset_name}' with {num_classes} classes.")
     print(f"[Data] Splits -> Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
