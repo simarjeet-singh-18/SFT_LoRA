@@ -238,7 +238,9 @@ def evaluate_and_save_misclassified(
 
 def main():
     parser = argparse.ArgumentParser(description="SFP Single Filter + LoRA Fine-Tuning")
-    parser.add_argument("--dataset", type=str, default="pets", choices=["pets", "svhn", "flowers102", "dtd", "caltech101", "cifar100"])
+    parser.add_argument("--dataset", type=str, default="pets",
+                         choices=["pets", "svhn", "flowers102", "dtd", "caltech101", "cifar100",
+                                  "pcam", "clevr", "dsprites-loc", "dsprites-ori"])
     parser.add_argument("--num-samples", type=int, default=1000)
     parser.add_argument("--use-full-dataset", action="store_true")
     parser.add_argument("--pruned-block", type=int, default=-1, help="-1 runs SNIP search automatically")
@@ -256,7 +258,20 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="LR for filter block, LayerNorm, and head")
     parser.add_argument("--lora-lr", type=float, default=3e-4, help="LR for LoRA adapter params (A/B matrices)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=50,
+                         help="Number of training epochs. Set to -1 to enable early stopping "
+                              "instead of a fixed epoch count (applies identically to all three "
+                              "modes: --full-finetune, SFT-only, SFT+LoRA) -- training then runs "
+                              "up to --max-epochs, stopping early if val accuracy hasn't improved "
+                              "for --patience consecutive epochs.")
+    parser.add_argument("--patience", type=int, default=10,
+                         help="Early stopping patience (epochs without val-acc improvement before "
+                              "stopping). Only used when --epochs -1.")
+    parser.add_argument("--max-epochs", type=int, default=200,
+                         help="Safety ceiling on total epochs when --epochs -1 (early stopping "
+                              "mode). Also used as the cosine LR schedule's horizon in that mode, "
+                              "since the actual stopping epoch isn't known in advance. Ignored "
+                              "when --epochs is set to a positive value.")
     parser.add_argument("--warmup-epochs", type=int, default=0,
                          help="Linear LR warmup epochs before cosine decay begins. 0 disables warmup.")
     parser.add_argument("--min-lr-ratio", type=float, default=0.0,
@@ -282,8 +297,19 @@ def main():
                               "and confidence. Works identically for SFP, SFP+LoRA, and --full-finetune.")
     parser.add_argument("--max-misclassified-images", type=int, default=-1,
                          help="Cap on how many misclassified images to save to disk (<=0 = unlimited). "
-                              "Test accuracy/loss are still computed over the full test set regardless.")
+                              "Test accuracy/loss are still computed over the full test set regardless. "
+                              "Default is unlimited so misclassified_log.csv is always complete -- capping "
+                              "would make comparisons across runs ambiguous (can't tell 'correct' apart "
+                              "from 'wrong but not logged').")
     args = parser.parse_args()
+
+    if args.epochs != -1 and args.epochs <= 0:
+        parser.error("--epochs must be a positive integer, or exactly -1 to enable early stopping.")
+    if args.patience <= 0:
+        parser.error("--patience must be a positive integer.")
+
+    early_stopping_enabled = (args.epochs == -1)
+    effective_epochs = args.max_epochs if early_stopping_enabled else args.epochs
 
     # The --lr default (1e-3) was tuned for SFP's tiny filter block + LN + head
     # (~0.6-2.8M params). Applied to the ENTIRE pretrained backbone in --full-finetune
@@ -378,8 +404,8 @@ def main():
     # Each param group decays from its own peak LR down to min_lr_ratio * peak, over
     # (epochs - warmup_epochs) steps, with an optional linear warmup beforehand.
     # eta_min is set per-group since main_params and lora_params can have different peak LRs.
-    warmup_epochs = min(args.warmup_epochs, max(args.epochs - 1, 0))
-    cosine_epochs = max(args.epochs - warmup_epochs, 1)
+    warmup_epochs = min(args.warmup_epochs, max(effective_epochs - 1, 0))
+    cosine_epochs = max(effective_epochs - warmup_epochs, 1)
     eta_mins = [args.lr * args.min_lr_ratio, args.lora_lr * args.min_lr_ratio]
 
     cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -403,12 +429,17 @@ def main():
 
     criterion = nn.CrossEntropyLoss()
 
-    print(f"[SFP] Starting training for {args.epochs} epochs on {args.dataset.upper()}...")
+    if early_stopping_enabled:
+        print(f"[SFP] Starting training on {args.dataset.upper()} with EARLY STOPPING "
+              f"(patience={args.patience}, max_epochs={effective_epochs})...")
+    else:
+        print(f"[SFP] Starting training for {args.epochs} epochs on {args.dataset.upper()}...")
     best_val, best_epoch, best_path = 0.0, 0, os.path.join(output_dir, f"best_sfp_lora_{args.dataset}.pt")
+    epochs_without_improvement = 0
 
     history = {"epoch": [], "train_loss": [], "val_loss": [], "val_acc": [], "lr_main": [], "lr_lora": []}
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, effective_epochs + 1):
         model.train()
         running_loss = 0.0
         for batch in train_loader:
@@ -440,11 +471,16 @@ def main():
         if val_acc > best_val:
             best_val, best_epoch = val_acc, epoch
             torch.save(model.state_dict(), best_path)
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
         lr_lora_display = f"{lr_lora_now:.2e}" if lr_lora_now is not None else "n/a"
-        print(f"[Epoch {epoch:03d}/{args.epochs:03d}] Train Loss: {epoch_loss:.4f} | "
-              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | Best Val: {best_val:.2f}% | "
-              f"LR(main/lora): {lr_main_now:.2e}/{lr_lora_display}")
+        epoch_display = f"{epoch:03d}/{effective_epochs:03d}" + (" (max)" if early_stopping_enabled else "")
+        patience_display = f" | No-improve: {epochs_without_improvement}/{args.patience}" if early_stopping_enabled else ""
+        print(f"[Epoch {epoch_display}] Train Loss: {epoch_loss:.4f} | "
+              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | Best Val: {best_val:.2f}%"
+              f"{patience_display} | LR(main/lora): {lr_main_now:.2e}/{lr_lora_display}")
 
         scheduler.step()
         # Manually floor each group's LR at min_lr_ratio * its own peak, since
@@ -453,6 +489,11 @@ def main():
         for group, peak_lr, eta_min in zip(optimizer.param_groups, [args.lr, args.lora_lr], eta_mins):
             if group["lr"] < eta_min:
                 group["lr"] = eta_min
+
+        if early_stopping_enabled and epochs_without_improvement >= args.patience:
+            print(f"[SFP] Early stopping triggered: no val-acc improvement for {args.patience} "
+                  f"epoch(s) (best={best_val:.2f}% @ epoch {best_epoch}). Stopping at epoch {epoch}.")
+            break
 
     # Save curves + raw per-epoch history as soon as training finishes, so they exist
     # even if something later (checkpoint reload, test eval) fails.
@@ -503,6 +544,10 @@ def main():
         "min_lr_ratio": args.min_lr_ratio,
         "weight_decay": args.weight_decay,
         "epochs": args.epochs,
+        "early_stopping_enabled": early_stopping_enabled,
+        "patience": args.patience if early_stopping_enabled else None,
+        "max_epochs": effective_epochs if early_stopping_enabled else None,
+        "epochs_trained": len(history["epoch"]),
         "batch_size": args.batch_size,
         "best_val_acc": best_val,
         "best_epoch": best_epoch,
