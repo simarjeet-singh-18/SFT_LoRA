@@ -1,9 +1,13 @@
+import json
 import os
 import random
+import urllib.request
+import zipfile
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset, random_split
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 from torchvision import datasets, transforms
 
 # Centralized so other modules (e.g. misclassified-image denormalization) use the
@@ -47,6 +51,141 @@ def get_class_names(dataset, num_classes: int) -> list:
     return [str(i) for i in range(num_classes)]
 
 
+CLEVR_URL = "https://cs.stanford.edu/people/jcjohns/clevr/CLEVR_v1.0.zip"
+DSPRITES_URL = ("https://github.com/deepmind/dsprites-dataset/raw/master/"
+                "dsprites_ndarray_co1sh3sc6or40x32y32_64x64.npz")
+
+
+class ClevrCountDataset(Dataset):
+    """
+    CLEVR (Johnson et al. 2017): synthetic 3D-rendered scenes, originally built for
+    visual reasoning / VQA. VTAB's "Clevr/Count" structured task repurposes it as
+    image classification: predict the NUMBER OF OBJECTS in the scene (a proxy for
+    counting ability), using the object count as a discrete class label.
+
+    WARNING: the official CLEVR_v1.0.zip download is ~18GB with no lighter official
+    mirror. First use on a fresh machine will take a long time and needs ~20GB+ free
+    disk space (zip + extracted copy). If already extracted at
+    <root>/CLEVR_v1.0/, this loader skips the download/extraction entirely.
+
+    CLEVR does not release scene annotations for its official test split, so -- like
+    the original VTAB protocol -- we use official "train" images+scenes as our train
+    pool, and official "val" images+scenes as our test pool.
+    """
+
+    def __init__(self, root: str, split: str = "train", transform=None, download: bool = True):
+        assert split in ("train", "val"), "ClevrCountDataset split must be 'train' or 'val'"
+        self.transform = transform
+
+        os.makedirs(root, exist_ok=True)
+        zip_path = os.path.join(root, "CLEVR_v1.0.zip")
+        extract_dir = os.path.join(root, "CLEVR_v1.0")
+
+        if download and not os.path.isdir(extract_dir):
+            if not os.path.exists(zip_path):
+                print("[Data] Downloading CLEVR_v1.0.zip (~18GB) -- this will take a while...")
+                urllib.request.urlretrieve(CLEVR_URL, zip_path)
+            print("[Data] Extracting CLEVR_v1.0.zip ...")
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(root)
+
+        scenes_path = os.path.join(extract_dir, "scenes", f"CLEVR_{split}_scenes.json")
+        images_dir = os.path.join(extract_dir, "images", split)
+
+        with open(scenes_path, "r") as f:
+            scenes = json.load(f)["scenes"]
+
+        counts = [len(s["objects"]) for s in scenes]
+        self.min_count, self.max_count = min(counts), max(counts)
+        # Class labels are the object count, zero-indexed from the observed minimum
+        # (e.g. counts 3-10 -> classes 0-7), matching the VTAB Clevr/Count protocol.
+        self.classes = [str(c) for c in range(self.min_count, self.max_count + 1)]
+
+        self.samples = [
+            (os.path.join(images_dir, s["image_filename"]), len(s["objects"]) - self.min_count)
+            for s in scenes
+        ]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+
+class DSpritesDataset(Dataset):
+    """
+    dSprites (Matthey et al. 2017): procedurally generated 2D shapes, varying 5
+    independent latent factors (shape, scale, orientation, position X, position Y).
+    VTAB's "dSprites/loc" and "dSprites/ori" structured tasks turn this into
+    classification by discretizing ONE continuous latent factor into bins and using
+    that as the label.
+
+    NOTE: this is a SIMPLIFIED PROXY for VTAB's exact protocol, not a byte-for-byte
+    reproduction -- we discretize a single position axis (posX) for "loc" and the
+    orientation angle for "ori" into `num_bins` equal-width bins, using our own
+    seeded random train/test split. VTAB's original fixed label files aren't
+    public, so exact numeric parity with the paper's dSprites numbers isn't
+    expected; this is meant to test the same kind of task (large domain gap,
+    synthetic/structured), not reproduce their exact split.
+
+    The full dSprites corpus is 737,280 images. To keep memory bounded, we first
+    take a seeded random subsample of size `max_total_samples` from the full
+    corpus, THEN split that subsample 80/20 into train/test pools.
+    """
+
+    def __init__(self, root: str, task: str = "loc", split: str = "train", transform=None,
+                 num_bins: int = 16, train_frac: float = 0.8, max_total_samples: int = 20000,
+                 seed: int = 42, download: bool = True):
+        assert task in ("loc", "ori"), "DSpritesDataset task must be 'loc' or 'ori'"
+        assert split in ("train", "test"), "DSpritesDataset split must be 'train' or 'test'"
+        self.transform = transform
+
+        os.makedirs(root, exist_ok=True)
+        npz_path = os.path.join(root, "dsprites.npz")
+        if download and not os.path.exists(npz_path):
+            print("[Data] Downloading dSprites dataset (~26MB)...")
+            urllib.request.urlretrieve(DSPRITES_URL, npz_path)
+
+        with np.load(npz_path, allow_pickle=True, encoding="latin1") as data:
+            imgs = data["imgs"]                       # (737280, 64, 64), values in {0, 1}
+            latents_values = data["latents_values"]    # columns: color, shape, scale, orientation, posX, posY
+
+        rng = np.random.RandomState(seed)
+        total = imgs.shape[0]
+        capped = min(max_total_samples, total)
+        subset_idx = rng.choice(total, size=capped, replace=False)
+
+        imgs = imgs[subset_idx]
+        latents_values = latents_values[subset_idx]
+
+        raw = latents_values[:, 4] if task == "loc" else latents_values[:, 3]  # posX or orientation
+        bin_edges = np.linspace(raw.min(), raw.max(), num_bins + 1)
+        labels = np.clip(np.digitize(raw, bin_edges[1:-1]), 0, num_bins - 1).astype(np.int64)
+
+        # Split the (already-capped) subsample into train/test pools deterministically.
+        perm = rng.permutation(capped)
+        split_at = int(train_frac * capped)
+        idx = perm[:split_at] if split == "train" else perm[split_at:]
+
+        self.imgs = imgs[idx]
+        self.labels = labels[idx]
+        self.classes = [str(i) for i in range(num_bins)]
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def __getitem__(self, i):
+        img = Image.fromarray((self.imgs[i] * 255).astype(np.uint8)).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, int(self.labels[i])
+
+
 def get_dataset_by_name(name: str, root: str, train: bool, transform, seed: int = 42):
     """
     Helper to fetch torchvision standard datasets.
@@ -76,6 +215,25 @@ def get_dataset_by_name(name: str, root: str, train: bool, transform, seed: int 
         return train_set if train else test_set
     elif name == "cifar100":
         return datasets.CIFAR100(root=root, train=train, download=True, transform=transform)
+    elif name == "pcam":
+        # VTAB "Specialized" domain: histopathology patches, binary tumor/no-tumor.
+        split = "train" if train else "test"
+        return datasets.PCAM(root=root, split=split, download=True, transform=transform)
+    elif name in ("clevr", "clevr-count", "clevr_count"):
+        # VTAB "Structured" domain: object-counting task. ~18GB download, see class docstring.
+        split = "train" if train else "val"  # CLEVR test split has no public labels
+        return ClevrCountDataset(root=os.path.join(root, "clevr"), split=split,
+                                  transform=transform, download=True)
+    elif name in ("dsprites-loc", "dsprites_loc"):
+        # VTAB "Structured" domain: synthetic position-classification proxy task.
+        split = "train" if train else "test"
+        return DSpritesDataset(root=os.path.join(root, "dsprites"), task="loc", split=split,
+                                transform=transform, seed=seed, download=True)
+    elif name in ("dsprites-ori", "dsprites_ori"):
+        # VTAB "Structured" domain: synthetic orientation-classification proxy task.
+        split = "train" if train else "test"
+        return DSpritesDataset(root=os.path.join(root, "dsprites"), task="ori", split=split,
+                                transform=transform, seed=seed, download=True)
     else:
         raise ValueError(f"Dataset '{name}' is not supported yet.")
 
@@ -119,6 +277,8 @@ def get_dataloaders(args):
         num_classes = 10
     elif dataset_name in ["flowers", "flowers102"]:
         num_classes = 102
+    elif dataset_name == "pcam":
+        num_classes = 2
     else:
         num_classes = getattr(args, "num_classes", 100)
 

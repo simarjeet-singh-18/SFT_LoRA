@@ -118,18 +118,25 @@ def plot_training_curves(history: dict, save_dir: str, dataset_name: str = "") -
     return {"loss_curve": loss_path, "val_accuracy_curve": acc_path, "combined_curve": combined_path}
 
 
-def plot_snip_saliency(saliencies: dict, selected_idx: int, save_dir: str) -> str:
+def plot_snip_saliency(saliencies: dict, selected_idx, save_dir: str) -> str:
+    """
+    selected_idx: a single int (legacy single-block selection) or a list/set of
+    ints (multi-block selection) -- all get highlighted in red.
+    """
+    selected_set = {selected_idx} if isinstance(selected_idx, int) else set(selected_idx)
+
     ensure_dir(save_dir)
     items = sorted(saliencies.items(), key=lambda kv: kv[0])
     indices = [i for i, _ in items]
     scores = [s for _, s in items]
-    colors = ["red" if i == selected_idx else "tab:blue" for i in indices]
+    colors = ["red" if i in selected_set else "tab:blue" for i in indices]
 
     plt.figure(figsize=(9, 5))
     plt.bar(indices, scores, color=colors)
     plt.xlabel("Block Index")
     plt.ylabel("SNIP Saliency Score")
-    plt.title(f"Per-Block SNIP Saliency (selected block {selected_idx} shown in red)")
+    selected_str = ", ".join(str(i) for i in sorted(selected_set))
+    plt.title(f"Per-Block SNIP Saliency (selected block(s) {selected_str} shown in red)")
     plt.xticks(indices)
     plt.grid(alpha=0.3, axis="y")
     plt.tight_layout()

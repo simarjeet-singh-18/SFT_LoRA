@@ -19,8 +19,14 @@ from torchvision.utils import save_image
 import timm
 
 from data import get_dataloaders, IMAGENET_MEAN, IMAGENET_STD
-from single_filter_lora import apply_single_filter_and_lora, count_parameter_breakdown
-from snip_selection import select_block_with_snip
+from single_filter_lora import (
+    apply_single_filter_and_lora,
+    count_parameter_breakdown,
+    substitute_filter_block,
+    inject_lora,
+    freeze_non_trainable,
+)
+from snip_selection import select_block_with_snip, select_blocks_with_snip
 from run_naming import build_run_folder_name
 from plotting import (
     ensure_dir,
@@ -243,13 +249,51 @@ def main():
                                   "pcam", "clevr", "dsprites-loc", "dsprites-ori"])
     parser.add_argument("--num-samples", type=int, default=1000)
     parser.add_argument("--use-full-dataset", action="store_true")
-    parser.add_argument("--pruned-block", type=int, default=-1, help="-1 runs SNIP search automatically")
+    parser.add_argument("--pruned-block", type=int, default=-1,
+                         help="-1 runs SNIP auto-search. Only valid when --num-filter-blocks 1 "
+                              "(manually specifying a fixed set of multiple blocks isn't supported "
+                              "yet -- use SNIP auto-search via --num-filter-blocks for that).")
+    parser.add_argument("--num-filter-blocks", type=int, default=1,
+                         help="How many blocks (top-N by LOWEST SNIP saliency) to replace with filter "
+                              "blocks. 1 = original single-block SFP behavior. N>1 replaces the N "
+                              "least-salient blocks sequentially (each one's pseudoinverse init is "
+                              "computed AFTER earlier substitutions in the set, so later filter blocks "
+                              "correctly learn from the already-modified preceding representations). "
+                              "LoRA (if --lora-rank > 0) is injected into every block NOT in this set. "
+                              "Caution: the paper's own ablation found 2-block substitution slightly "
+                              "underperforming 1-block on their subtractive-only method -- more filter "
+                              "blocks isn't automatically better, treat this as a real hyperparameter.")
+    parser.add_argument("--filter-block-layers", type=int, default=1,
+                         help="Number of stacked FC layers per filter block (default 1 = paper's "
+                              "original single-layer construction). N>1 uses a generalized "
+                              "pseudoinverse init: N-1 layers start as identity, 1 layer gets the "
+                              "solved pseudoinverse matrix -- so the WHOLE STACK is mathematically "
+                              "identical to the N=1 case at initialization, regardless of depth. NOTE: "
+                              "since layers are purely linear (no activation between them), stacking "
+                              "them does NOT add expressivity beyond a single layer by itself -- this "
+                              "is for experimenting with parameterization/depth, not a capacity boost.")
+    parser.add_argument("--filter-residual-hidden-dim", type=int, default=0,
+                         help="Hidden dim of an OPTIONAL nonlinear zero-init residual branch attached "
+                              "to each filter block: fc2(GELU(fc1(x))), with fc2 zero-initialized so "
+                              "the branch contributes exactly 0 at init (same safe-start trick as "
+                              "LoRA's zero-init B matrix) -- doesn't disturb the pseudoinverse-inherited "
+                              "behavior. 0 (default) = no residual branch (unchanged from all previous "
+                              "versions). This IS a genuine capacity boost (has a real nonlinearity), "
+                              "unlike --filter-block-layers which is linear-only.")
+    parser.add_argument("--filter-residual-alpha", type=float, default=1.0,
+                         help="Scaling for the residual branch's output = alpha / hidden_dim (mirrors "
+                              "LoRA's alpha/rank normalization). Only used when "
+                              "--filter-residual-hidden-dim > 0.")
+    parser.add_argument("--filter-residual-dropout", type=float, default=0.0,
+                         help="Dropout on the residual branch's output. Only used when "
+                              "--filter-residual-hidden-dim > 0.")
     parser.add_argument("--full-finetune", action="store_true",
                          help="Baseline comparison mode: bypass SNIP search, filter block substitution, "
                               "and LoRA entirely, and fine-tune the ENTIRE pretrained backbone + head "
                               "instead (i.e. the paper's 'Full' baseline in Table 1/2). "
-                              "--pruned-block, --lora-rank, --lora-alpha, --lora-dropout are ignored "
-                              "when this is set.")
+                              "--pruned-block, --num-filter-blocks, --filter-block-layers, "
+                              "--filter-residual-hidden-dim, --lora-rank, --lora-alpha, --lora-dropout "
+                              "are all ignored when this is set.")
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
     parser.add_argument("--lora-dropout", type=float, default=0.0,
@@ -307,6 +351,16 @@ def main():
         parser.error("--epochs must be a positive integer, or exactly -1 to enable early stopping.")
     if args.patience <= 0:
         parser.error("--patience must be a positive integer.")
+    if args.num_filter_blocks < 1:
+        parser.error("--num-filter-blocks must be >= 1.")
+    if args.filter_block_layers < 1:
+        parser.error("--filter-block-layers must be >= 1.")
+    if args.filter_residual_hidden_dim < 0:
+        parser.error("--filter-residual-hidden-dim must be >= 0 (0 disables the residual branch).")
+    if args.num_filter_blocks > 1 and args.pruned_block != -1:
+        parser.error("--pruned-block (a single manual block index) can't be combined with "
+                      "--num-filter-blocks > 1 (multi-block SNIP auto-selection). Leave "
+                      "--pruned-block at its default (-1) when using --num-filter-blocks > 1.")
 
     early_stopping_enabled = (args.epochs == -1)
     effective_epochs = args.max_epochs if early_stopping_enabled else args.epochs
@@ -340,12 +394,12 @@ def main():
     model = timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=num_classes)
     model.to(args.device)
 
-    # 3. Either: (a) SFP path - SNIP search -> pseudoinverse filter block -> optional LoRA, or
+    # 3. Either: (a) SFP path - SNIP search -> pseudoinverse filter block(s) -> optional LoRA, or
     #    (b)  Full-finetune baseline - skip all of that, unfreeze the entire model.
-    pruned_block_idx = None
+    pruned_block_indices = None   # list of ints once determined (None only for full-finetune)
     snip_saliencies = None
     snip_plot_path = None
-    filter_block = None
+    filter_blocks = []
 
     if args.full_finetune:
         print("[SFP] --full-finetune set: skipping SNIP search, filter block substitution, "
@@ -353,7 +407,9 @@ def main():
               "(this is the paper's 'Full' fine-tuning baseline).")
         for p in model.parameters():
             p.requires_grad = True
-    else:
+
+    elif args.num_filter_blocks == 1:
+        # Single-block path: identical behavior/logging to all previous versions.
         pruned_block_idx = args.pruned_block
         if pruned_block_idx < 0:
             print("[SFP] No block index provided. Running SNIP search...")
@@ -363,21 +419,59 @@ def main():
             snip_plot_path = plot_snip_saliency(snip_saliencies, pruned_block_idx, output_dir)
             print(f"[SFP] Saved SNIP saliency plot -> {snip_plot_path}")
 
-        # 4. Extract Block Input/Output features for Pseudo-Inverse Init
         print(f"[SFP] Extracting representations for Pseudo-Inverse Init at block {pruned_block_idx}...")
         X_in, X_out = extract_block_inputs_outputs(model, train_loader, pruned_block_idx, args.device)
 
-        # 5. Substitute Single Filter & Inject LoRA (LoRA is a no-op if --lora-rank 0)
         filter_block = apply_single_filter_and_lora(
             model,
             pruned_block_idx=pruned_block_idx,
             lora_rank=args.lora_rank,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
+            filter_num_layers=args.filter_block_layers,
+            filter_residual_hidden_dim=args.filter_residual_hidden_dim,
+            filter_residual_alpha=args.filter_residual_alpha,
+            filter_residual_dropout=args.filter_residual_dropout,
         )
-
-        # Initialize single filter weights via Ridge Pseudo-Inverse
         filter_block.init_from_pinv(X_in.to(args.device), X_out.to(args.device))
+        filter_blocks = [filter_block]
+        pruned_block_indices = [pruned_block_idx]
+
+    else:
+        # Multi-block path (--num-filter-blocks > 1): SNIP auto-selects the N
+        # least-salient blocks, substituted SEQUENTIALLY (increasing index order)
+        # so each later filter block's pseudoinverse init is computed from the
+        # model's already-partially-modified state -- matches the paper's own
+        # sequential dual-layer construction (Fig. 3), just generalized to N.
+        print(f"[SFP] Running SNIP search for {args.num_filter_blocks} filter block(s)...")
+        pruned_block_indices, snip_saliencies = select_blocks_with_snip(
+            model, train_loader, device=args.device, num_blocks=args.num_filter_blocks,
+            keep="low", return_scores=True
+        )
+        snip_plot_path = plot_snip_saliency(snip_saliencies, pruned_block_indices, output_dir)
+        print(f"[SFP] Saved SNIP saliency plot -> {snip_plot_path}")
+
+        for idx in pruned_block_indices:
+            print(f"[SFP] Extracting representations for Pseudo-Inverse Init at block {idx}...")
+            X_in, X_out = extract_block_inputs_outputs(model, train_loader, idx, args.device)
+            fb = substitute_filter_block(
+                model, idx, num_layers=args.filter_block_layers,
+                residual_hidden_dim=args.filter_residual_hidden_dim,
+                residual_alpha=args.filter_residual_alpha,
+                residual_dropout=args.filter_residual_dropout,
+            )
+            fb.init_from_pinv(X_in.to(args.device), X_out.to(args.device))
+            filter_blocks.append(fb)
+            layer_desc = "Single" if args.filter_block_layers <= 1 else f"{args.filter_block_layers}-Layer"
+            residual_desc = f" + residual(hidden={args.filter_residual_hidden_dim})" if args.filter_residual_hidden_dim > 0 else ""
+            print(f"[SFP-MultiFilter] Substituted block {idx} with {layer_desc} Filter Block{residual_desc}.")
+
+        lora_params = inject_lora(model, pruned_block_indices, args.lora_rank, args.lora_alpha, args.lora_dropout)
+        ln_params = freeze_non_trainable(model, pruned_block_indices)
+        print(f"[SFP-MultiFilter] Injected {lora_params:,} LoRA parameters "
+              f"(rank={args.lora_rank}, alpha={args.lora_alpha}, dropout={args.lora_dropout}) "
+              f"across all blocks except {pruned_block_indices}.")
+        print(f"[SFP-MultiFilter] Unfroze {ln_params:,} LayerNorm parameters across all blocks.")
 
     # 6. Optimization Loop
     model.to(args.device)
@@ -523,7 +617,7 @@ def main():
         test_loss, test_acc = evaluate_full(model, test_loader, args.device, criterion)
 
     # Parameter breakdown (filter block / LoRA / LayerNorm / head / frozen backbone)
-    param_breakdown = count_parameter_breakdown(model, pruned_block_idx)
+    param_breakdown = count_parameter_breakdown(model, pruned_block_indices)
     param_plot_path = plot_param_breakdown(param_breakdown, output_dir)
     print(f"[SFP] Saved parameter breakdown plot -> {param_plot_path}")
 
@@ -532,7 +626,12 @@ def main():
         "num_classes": num_classes,
         "num_samples": args.num_samples if not args.use_full_dataset else "full",
         "full_finetune": args.full_finetune,
-        "pruned_block_idx": pruned_block_idx,
+        "pruned_block_idx": pruned_block_indices,
+        "num_filter_blocks": args.num_filter_blocks,
+        "filter_block_layers": args.filter_block_layers,
+        "filter_residual_hidden_dim": args.filter_residual_hidden_dim,
+        "filter_residual_alpha": args.filter_residual_alpha if args.filter_residual_hidden_dim > 0 else None,
+        "filter_residual_dropout": args.filter_residual_dropout if args.filter_residual_hidden_dim > 0 else None,
         "lora_rank": args.lora_rank if not args.full_finetune else None,
         "lora_alpha": args.lora_alpha if not args.full_finetune else None,
         "lora_dropout": args.lora_dropout if not args.full_finetune else None,
@@ -577,7 +676,8 @@ def main():
     if args.full_finetune:
         print(f"[SFP] Mode: FULL FINE-TUNE (baseline, no SFP/LoRA)")
     else:
-        print(f"[SFP] Mode: SFP | Replaced Block: {pruned_block_idx} | "
+        layer_desc = "Single" if args.filter_block_layers <= 1 else f"{args.filter_block_layers}-Layer"
+        print(f"[SFP] Mode: SFP | Replaced Block(s): {pruned_block_indices} ({layer_desc} Filter Block) | "
               f"LoRA rank={args.lora_rank}, alpha={args.lora_alpha}, dropout={args.lora_dropout}")
     print(f"[SFP] Trainable Params: {param_breakdown['trainable_params']:,} / "
           f"{param_breakdown['total_params']:,} ({param_breakdown['trainable_pct']:.2f}%)")

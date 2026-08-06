@@ -18,14 +18,21 @@ Usage:
 
 <run_output_dir> must be the output directory of a --lora-rank > 0 training run,
 containing metrics_summary.json and the saved best-checkpoint .pt file. Reuses
-apply_single_filter_and_lora() from single_filter_lora.py to reconstruct the exact
-same wrapped architecture that was trained, so the checkpoint loads correctly.
+substitute_filter_block() / inject_lora() / freeze_non_trainable() from
+single_filter_lora.py to reconstruct the exact same wrapped architecture that was
+trained (supports single-block and multi-block --num-filter-blocks runs,
+--filter-block-layers 1 and >1, and --filter-residual-hidden-dim 0 and >0), so the
+checkpoint loads correctly.
+
+Handles both current metrics_summary.json format (pruned_block_idx as a list) and
+older formats (pruned_block_idx as a single int, filter_block_layers /
+filter_residual_hidden_dim absent -> default to 1 / 0 respectively, matching what
+existed before those fields were added).
 
 ASSUMPTION: reconstructs using the default target_keywords ["qkv", "proj", "fc1",
-"fc2"] from apply_single_filter_and_lora -- this matches every run produced by the
-current train_sfp_lora.py (that parameter isn't exposed as a CLI flag / recorded in
-metrics_summary.json, so this script assumes it wasn't changed between training and
-now).
+"fc2"] -- this matches every run produced by the current train_sfp_lora.py (that
+parameter isn't exposed as a CLI flag / recorded in metrics_summary.json, so this
+script assumes it wasn't changed between training and now).
 """
 
 import argparse
@@ -35,7 +42,7 @@ import os
 import timm
 import torch
 
-from single_filter_lora import LoRALinear, apply_single_filter_and_lora
+from single_filter_lora import LoRALinear, substitute_filter_block, inject_lora, freeze_non_trainable
 
 
 def load_run_model(output_dir: str, device: str = "cpu"):
@@ -53,7 +60,24 @@ def load_run_model(output_dir: str, device: str = "cpu"):
     if not lora_rank or lora_rank <= 0:
         raise ValueError(f"This run used lora_rank={lora_rank} -- there are no LoRA modules to inspect.")
 
-    pruned_block_idx = summary["pruned_block_idx"]
+    # pruned_block_idx is a list in current metrics_summary.json (multi-block support),
+    # but was a single int in older summaries -- normalize to a list either way.
+    raw_pruned = summary["pruned_block_idx"]
+    pruned_block_indices = [raw_pruned] if isinstance(raw_pruned, int) else list(raw_pruned)
+
+    # filter_block_layers wasn't recorded in older summaries -- default to 1
+    # (the only option that existed before this field was added).
+    filter_block_layers = summary.get("filter_block_layers", 1)
+
+    # filter_residual_hidden_dim wasn't recorded in older summaries either --
+    # default to 0 (no residual branch, the only option that existed before this
+    # field was added). Must match what was actually trained with, or
+    # load_state_dict below will fail (missing/unexpected keys for the residual
+    # branch's fc1/fc2 params).
+    filter_residual_hidden_dim = summary.get("filter_residual_hidden_dim", 0) or 0
+    filter_residual_alpha = summary.get("filter_residual_alpha") or 1.0
+    filter_residual_dropout = summary.get("filter_residual_dropout") or 0.0
+
     lora_alpha = summary.get("lora_alpha", 32.0)
     lora_dropout = summary.get("lora_dropout", 0.0) or 0.0
     num_classes = summary["num_classes"]
@@ -63,21 +87,28 @@ def load_run_model(output_dir: str, device: str = "cpu"):
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    print(f"[Diagnostic] Rebuilding architecture: pruned_block_idx={pruned_block_idx}, "
-          f"lora_rank={lora_rank}, lora_alpha={lora_alpha}, lora_dropout={lora_dropout}, "
-          f"num_classes={num_classes}")
+    print(f"[Diagnostic] Rebuilding architecture: pruned_block_indices={pruned_block_indices}, "
+          f"filter_block_layers={filter_block_layers}, "
+          f"filter_residual_hidden_dim={filter_residual_hidden_dim}, "
+          f"lora_rank={lora_rank}, lora_alpha={lora_alpha}, "
+          f"lora_dropout={lora_dropout}, num_classes={num_classes}")
 
     # pretrained=False is safe AND faster here: every weight gets immediately
     # overwritten by the checkpoint's state_dict below, so the initial pretrained
     # weights are never actually used -- no need to download them.
     model = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=num_classes)
-    apply_single_filter_and_lora(
-        model,
-        pruned_block_idx=pruned_block_idx,
-        lora_rank=lora_rank,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-    )
+
+    # Reconstruct the architecture: substitute each filter block (no pinv init needed
+    # here -- the checkpoint's state_dict below overwrites all these weights anyway,
+    # we just need matching shapes/parameter names), then inject LoRA + freeze.
+    for idx in pruned_block_indices:
+        substitute_filter_block(
+            model, idx, num_layers=filter_block_layers,
+            residual_hidden_dim=filter_residual_hidden_dim,
+            residual_alpha=filter_residual_alpha, residual_dropout=filter_residual_dropout,
+        )
+    inject_lora(model, pruned_block_indices, lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+    freeze_non_trainable(model, pruned_block_indices)
 
     state_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state_dict, strict=True)
