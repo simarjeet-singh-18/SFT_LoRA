@@ -25,6 +25,7 @@ from single_filter_lora import (
     substitute_filter_block,
     inject_lora,
     freeze_non_trainable,
+    compute_lora_orthogonality_loss,
 )
 from snip_selection import select_block_with_snip, select_blocks_with_snip
 from run_naming import build_run_folder_name
@@ -299,10 +300,20 @@ def main():
     parser.add_argument("--lora-dropout", type=float, default=0.0,
                          help="Dropout applied to LoRA adapter input (0.0 disables it). "
                               "Useful regularization when training on small subsets (e.g. VTAB-1k-style splits).")
+    parser.add_argument("--lora-ortho-lambda1", type=float, default=0.0,
+                         help="Weight (lambda1) on the ||A @ A.T - I||_F^2 orthogonality penalty applied to "
+                              "every LoRA lora_A matrix. Pushes each adapter's rank rows to be mutually "
+                              "orthonormal, i.e. discourages them from learning linearly-dependent / redundant "
+                              "directions. 0.0 (default) disables it entirely -- identical behavior to before "
+                              "this flag existed.")
+    parser.add_argument("--lora-ortho-lambda2", type=float, default=0.0,
+                         help="Weight (lambda2) on the ||B.T @ B - I||_F^2 orthogonality penalty applied to "
+                              "every LoRA lora_B matrix (columns instead of rows, mirroring lambda1 for A). "
+                              "0.0 (default) disables it.")
     parser.add_argument("--lr", type=float, default=1e-3, help="LR for filter block, LayerNorm, and head")
     parser.add_argument("--lora-lr", type=float, default=3e-4, help="LR for LoRA adapter params (A/B matrices)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--epochs", type=int, default=50,
+    parser.add_argument("--epochs", type=int, default=-1,
                          help="Number of training epochs. Set to -1 to enable early stopping "
                               "instead of a fixed epoch count (applies identically to all three "
                               "modes: --full-finetune, SFT-only, SFT+LoRA) -- training then runs "
@@ -532,22 +543,42 @@ def main():
     epochs_without_improvement = 0
 
     history = {"epoch": [], "train_loss": [], "val_loss": [], "val_acc": [], "lr_main": [], "lr_lora": []}
+    ortho_enabled = (args.lora_ortho_lambda1 != 0.0) or (args.lora_ortho_lambda2 != 0.0)
+    if ortho_enabled:
+        history["train_ortho_loss"] = []
+        print(f"[SFP] LoRA orthogonality regularization ENABLED: "
+              f"lambda1={args.lora_ortho_lambda1} (||A@A.T - I||^2), "
+              f"lambda2={args.lora_ortho_lambda2} (||B.T@B - I||^2)")
 
     for epoch in range(1, effective_epochs + 1):
         model.train()
         running_loss = 0.0
+        running_ortho_loss = 0.0
         for batch in train_loader:
             x, y = batch[0].to(args.device), batch[1].to(args.device)
             optimizer.zero_grad()
             out = model(x)
-            loss = criterion(out, y)
+            task_loss = criterion(out, y)
+            # L = general_loss + lambda1 * ||A @ A.T - I||_F^2 + lambda2 * ||B.T @ B - I||_F^2,
+            # summed over every LoRA adapter in the model. See
+            # single_filter_lora.compute_lora_orthogonality_loss / LoRALinear.orthogonality_penalty
+            # for why A@A.T / B.T@B (not A.T@A / B@B.T) are the correct shapes here.
+            # Returns exactly 0.0 (no graph) when both lambdas are 0, so this is a
+            # strict no-op unless the new flags are explicitly passed.
+            ortho_loss = compute_lora_orthogonality_loss(
+                model, args.lora_ortho_lambda1, args.lora_ortho_lambda2
+            )
+            loss = task_loss + ortho_loss
             loss.backward()
             if args.grad_clip > 0.0:
                 torch.nn.utils.clip_grad_norm_(main_params + lora_params, max_norm=args.grad_clip)
             optimizer.step()
-            running_loss += loss.item() * x.size(0)
+            running_loss += task_loss.item() * x.size(0)
+            if ortho_enabled:
+                running_ortho_loss += ortho_loss.item() * x.size(0)
 
         epoch_loss = running_loss / len(train_loader.dataset)
+        epoch_ortho_loss = running_ortho_loss / len(train_loader.dataset) if ortho_enabled else None
         val_loss, val_acc = evaluate_full(model, val_loader, args.device, criterion)
 
         # Record current LR *before* stepping the scheduler for this epoch's log line,
@@ -561,6 +592,8 @@ def main():
         history["val_acc"].append(val_acc)
         history["lr_main"].append(lr_main_now)
         history["lr_lora"].append(lr_lora_now)
+        if ortho_enabled:
+            history["train_ortho_loss"].append(epoch_ortho_loss)
 
         if val_acc > best_val:
             best_val, best_epoch = val_acc, epoch
@@ -572,7 +605,8 @@ def main():
         lr_lora_display = f"{lr_lora_now:.2e}" if lr_lora_now is not None else "n/a"
         epoch_display = f"{epoch:03d}/{effective_epochs:03d}" + (" (max)" if early_stopping_enabled else "")
         patience_display = f" | No-improve: {epochs_without_improvement}/{args.patience}" if early_stopping_enabled else ""
-        print(f"[Epoch {epoch_display}] Train Loss: {epoch_loss:.4f} | "
+        ortho_display = f" | Ortho Loss: {epoch_ortho_loss:.4f}" if ortho_enabled else ""
+        print(f"[Epoch {epoch_display}] Train Loss: {epoch_loss:.4f}{ortho_display} | "
               f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | Best Val: {best_val:.2f}%"
               f"{patience_display} | LR(main/lora): {lr_main_now:.2e}/{lr_lora_display}")
 

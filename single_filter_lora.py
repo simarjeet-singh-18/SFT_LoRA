@@ -38,6 +38,63 @@ class LoRALinear(nn.Module):
             result = result + self.scaling * lora_out
         return result
 
+    def orthogonality_penalty(self):
+        """
+        Returns (A_term, B_term), the (rank x rank) residual matrices whose squared
+        Frobenius norm penalizes lora_A / lora_B for being far from row/column-
+        orthonormal. None if rank <= 0 (no LoRA params to regularize on this layer).
+
+        Shapes: lora_A is (rank, in_features), lora_B is (out_features, rank), with
+        rank << in_features/out_features. Because of that, lora_A can only ever have
+        AT MOST `rank` linearly independent directions among its in_features-dim rows
+        -- so the meaningful orthogonality constraint is on those `rank` ROWS being
+        mutually orthonormal, i.e. A @ A.T ~ I_rank (a (rank x rank) identity is
+        achievable; forcing A.T @ A, which is (in_features x in_features) and has
+        rank <= rank < in_features, could never equal an identity matrix).
+        Symmetrically for lora_B, whose `rank` COLUMNS are the quantity that can be
+        made orthonormal: B.T @ B ~ I_rank.
+
+        Driving both toward the identity pushes each adapter's `rank` update
+        directions to be linearly independent of one another, i.e. discourages the
+        adapter from wasting capacity by learning redundant (near-parallel) columns.
+        """
+        if self.rank <= 0:
+            return None
+        eye_r = torch.eye(self.rank, device=self.lora_A.device, dtype=self.lora_A.dtype)
+        A_term = self.lora_A @ self.lora_A.t() - eye_r   # (rank, rank)
+        B_term = self.lora_B.t() @ self.lora_B - eye_r   # (rank, rank)
+        return A_term, B_term
+
+
+def compute_lora_orthogonality_loss(model: nn.Module, lambda1: float = 0.0, lambda2: float = 0.0) -> torch.Tensor:
+    """
+    Sums the orthogonality regularizer lambda1 * ||A@A.T - I||_F^2 + lambda2 * ||B.T@B - I||_F^2
+    over every LoRALinear submodule in `model` (see LoRALinear.orthogonality_penalty
+    for why A@A.T / B.T@B, rather than A.T@A / B@B.T, are the well-posed choices
+    given LoRA's (rank, in_features) / (out_features, rank) shapes).
+
+    Returns a 0-dim tensor on the same device as the model's parameters, so it can
+    always be added directly to the task loss (returns exactly 0.0, with no graph
+    attached to lora_A/lora_B, when both lambdas are 0 -- the default -- so existing
+    training runs that don't pass either flag are numerically unaffected).
+    """
+    device = next(model.parameters()).device
+    total = torch.zeros((), device=device)
+    if lambda1 == 0.0 and lambda2 == 0.0:
+        return total
+
+    for module in model.modules():
+        if isinstance(module, LoRALinear) and module.rank > 0:
+            terms = module.orthogonality_penalty()
+            if terms is None:
+                continue
+            A_term, B_term = terms
+            if lambda1 != 0.0:
+                total = total + lambda1 * torch.sum(A_term * A_term)
+            if lambda2 != 0.0:
+                total = total + lambda2 * torch.sum(B_term * B_term)
+    return total
+
 
 class FilterResidualMLP(nn.Module):
     """
